@@ -1,20 +1,27 @@
 """
-长时序数据集构建模块
-====================
-构建 1995–2025 年松辽流域年度遥感数据集，自动协调 Landsat 5/7/8/9 传感器切换，
-融合 Sentinel-2（2015 年后），生成可直接用于分析的 xarray Dataset。
+长时序数据集构建模块（已更新为 MODIS 主力数据源）
+=======================================================
+构建 2000–2024 年松辽流域年度遥感数据集。
+
+数据源优先级（替代原 Landsat/GEE 方案）：
+  1. MODIS MOD13Q1 NDVI 250 m（16 天合成，via Planetary Computer STAC）← 主力
+  2. MODIS MOD09A1 地表反射率 500 m（8 天合成）← 水体/NDWI
+  3. MODIS MOD44W 年度水体掩膜 250 m          ← 河道提取
+  4. Sentinel-2 L2A（可选高分辨率补充）        ← 精细分析备用
+
+以上均通过 Planetary Computer STAC 免费直连，无需 Google 账号，无需预下载。
 
 用法示例
 --------
 >>> from src.processing.timeseries import TimeSeriesBuilder
 >>> builder = TimeSeriesBuilder(bbox=[119.0, 40.0, 132.0, 50.0])
->>> ts = builder.build(start_year=2015, end_year=2025)
+>>> ts = builder.build(start_year=2000, end_year=2023)
 >>> ts["ndvi"].sel(year=2020).plot()
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import xarray as xr
@@ -26,54 +33,45 @@ from config import (
     END_YEAR,
     GROWING_SEASON_MONTHS,
     MAX_CLOUD_COVER,
-    TARGET_RESOLUTION,
     TARGET_CRS,
+    NDVI_BARE_SOIL,
+    NDVI_FULL_COVER,
 )
-from src.data.landsat import LandsatLoader
-from src.data.sentinel2 import Sentinel2Loader
+from src.data.modis import MODISLoader
 from src.processing.preprocessing import compute_annual_composite, fill_missing_by_interpolation
-from src.processing.fusion import SensorFusion
 
 
 class TimeSeriesBuilder:
     """
-    构建长时序（逐年）遥感数据集。
+    构建长时序（逐年）遥感数据集，主力数据源为 MODIS。
 
     Parameters
     ----------
     bbox : list of float
         研究区范围 [west, south, east, north]。
     months : list of int
-        生长季月份，默认使用 config.GROWING_SEASON_MONTHS。
-    max_cloud_cover : int
-    resolution : int  空间分辨率（米）
+        生长季月份，默认 config.GROWING_SEASON_MONTHS。
+    ndvi_resolution : int
+        NDVI 分辨率（米），默认 250 m（MOD13Q1）。
+    sr_resolution : int
+        地表反射率分辨率（米），默认 500 m（MOD09A1）。
     crs : str
-    use_sentinel2 : bool
-        是否融合 Sentinel-2（2015 年后），默认 True。
     """
-
-    # Sentinel-2 首次可用年份
-    SENTINEL2_START_YEAR = 2015
 
     def __init__(
         self,
         bbox: Optional[List[float]] = None,
         months: Optional[List[int]] = None,
-        max_cloud_cover: int = MAX_CLOUD_COVER,
-        resolution: int = TARGET_RESOLUTION,
+        ndvi_resolution: int = 250,
+        sr_resolution: int = 500,
         crs: str = TARGET_CRS,
-        use_sentinel2: bool = True,
     ) -> None:
         self.bbox = bbox or STUDY_AREA_BBOX
         self.months = months or GROWING_SEASON_MONTHS
-        self.max_cloud_cover = max_cloud_cover
-        self.resolution = resolution
+        self.ndvi_resolution = ndvi_resolution
+        self.sr_resolution = sr_resolution
         self.crs = crs
-        self.use_sentinel2 = use_sentinel2
-
-        self._landsat = LandsatLoader()
-        self._sentinel2 = Sentinel2Loader() if use_sentinel2 else None
-        self._fusion = SensorFusion()
+        self._modis = MODISLoader()
 
     def build(
         self,
@@ -83,25 +81,25 @@ class TimeSeriesBuilder:
         fill_missing: bool = True,
     ) -> xr.Dataset:
         """
-        构建逐年时序数据集。
+        构建逐年时序数据集（MODIS 主力）。
 
         Parameters
         ----------
         start_year : int
         end_year : int
         composite_method : str  年度合成方法（"median" / "mean" / "max_ndvi"）
-        fill_missing : bool  是否插值填充缺失年份
+        fill_missing : bool     是否插值填充缺失年份
 
         Returns
         -------
         xr.Dataset
-            坐标：year（int）、y、x
-            变量：blue, green, red, nir, swir1, swir2, ndvi, ndwi, fvc
+            坐标：year、y、x
+            变量：ndvi, evi, ndwi, fvc, water_mask（可选）
         """
         years = list(range(start_year, end_year + 1))
         annual_composites: List[Optional[xr.Dataset]] = []
 
-        for year in tqdm(years, desc="构建年度合成影像"):
+        for year in tqdm(years, desc="构建 MODIS 年度合成"):
             try:
                 ds = self._build_single_year(year, composite_method)
                 annual_composites.append(ds)
@@ -112,21 +110,15 @@ class TimeSeriesBuilder:
         if fill_missing:
             annual_composites = fill_missing_by_interpolation(annual_composites, years)
 
-        # 沿年份维度合并
         valid_pairs = [
-            (year, ds) for year, ds in zip(years, annual_composites) if ds is not None
+            (y, ds) for y, ds in zip(years, annual_composites) if ds is not None
         ]
         if not valid_pairs:
             raise RuntimeError("所有年份均无有效数据，请检查数据访问配置。")
 
         valid_years = [p[0] for p in valid_pairs]
-        valid_ds = [p[1] for p in valid_pairs]
-
-        combined = xr.concat(valid_ds, dim="year")
+        combined = xr.concat([p[1] for p in valid_pairs], dim="year")
         combined["year"] = valid_years
-
-        # 计算派生指数
-        combined = self._compute_indices(combined)
 
         return combined
 
@@ -135,59 +127,65 @@ class TimeSeriesBuilder:
         year: int,
         composite_method: str,
     ) -> xr.Dataset:
-        """加载并合成单年数据。"""
-        # 加载 Landsat
-        ls_stack = self._landsat.load_year(
+        """加载并合成单年 MODIS 数据，返回含 ndvi/evi/ndwi/fvc 的 Dataset。"""
+        # ── 1. MOD13Q1 NDVI 250 m（主力植被指数）──
+        ndvi_ds = self._modis.load_ndvi(
             year=year,
             bbox=self.bbox,
             months=self.months,
-            max_cloud_cover=self.max_cloud_cover,
-            resolution=self.resolution,
+            resolution=self.ndvi_resolution,
             crs=self.crs,
         )
-        ls_composite = compute_annual_composite(ls_stack, method=composite_method)
+        ndvi_composite = compute_annual_composite(ndvi_ds, method=composite_method)
 
-        # 融合 Sentinel-2（2015 年起）
-        if self.use_sentinel2 and year >= self.SENTINEL2_START_YEAR and self._sentinel2:
-            try:
-                s2_stack = self._sentinel2.load_year(
-                    year=year,
-                    bbox=self.bbox,
-                    months=self.months,
-                    max_cloud_cover=self.max_cloud_cover,
-                    resolution=self.resolution,
-                    crs=self.crs,
-                )
-                s2_composite = compute_annual_composite(s2_stack, method=composite_method)
-                return self._fusion.fuse(ls_composite, s2_composite)
-            except ValueError:
-                # Sentinel-2 数据不足时退回纯 Landsat
-                return ls_composite
+        # ── 2. MOD09A1 地表反射率 500 m（用于计算 NDWI）──
+        try:
+            sr_ds = self._modis.load_surface_reflectance(
+                year=year,
+                bbox=self.bbox,
+                months=self.months,
+                resolution=self.sr_resolution,
+                crs=self.crs,
+            )
+            sr_composite = compute_annual_composite(sr_ds, method=composite_method)
+            ndwi = self._compute_ndwi(sr_composite)
+        except ValueError:
+            # MOD09A1 不可用时用 NDVI 代替（NDWI = NaN）
+            ndwi = xr.full_like(ndvi_composite["ndvi"], fill_value=np.nan)
+            ndwi.attrs = {"long_name": "NDWI（本年缺失 MOD09A1，填充 NaN）"}
 
-        return ls_composite
+        # ── 3. 计算 FVC 植被覆盖度 ──
+        fvc = self._compute_fvc(ndvi_composite["ndvi"])
 
-    def _compute_indices(self, ds: xr.Dataset) -> xr.Dataset:
-        """
-        计算 NDVI、NDWI 和 FVC 植被覆盖度。
-
-        NDVI = (NIR - Red) / (NIR + Red)
-        NDWI = (Green - NIR) / (Green + NIR)   [McFeeters, 1996]
-        FVC  = (NDVI - NDVI_min) / (NDVI_max - NDVI_min)
-        """
-        from config import NDVI_BARE_SOIL, NDVI_FULL_COVER
-
-        nir = ds["nir"]
-        red = ds["red"]
-        green = ds["green"]
-
-        ndvi = (nir - red) / (nir + red + 1e-10)
-        ndwi = (green - nir) / (green + nir + 1e-10)
-        fvc = (ndvi - NDVI_BARE_SOIL) / (NDVI_FULL_COVER - NDVI_BARE_SOIL)
-        fvc = fvc.clip(0.0, 1.0)
-
-        ds = ds.assign(
-            ndvi=ndvi.assign_attrs({"long_name": "归一化植被指数", "units": "dimensionless"}),
-            ndwi=ndwi.assign_attrs({"long_name": "归一化水体指数", "units": "dimensionless"}),
-            fvc=fvc.assign_attrs({"long_name": "植被覆盖度", "units": "fraction [0,1]"}),
+        # ── 4. 汇总为单年 Dataset ──
+        ds = xr.Dataset(
+            {
+                "ndvi": ndvi_composite["ndvi"],
+                "evi":  ndvi_composite["evi"],
+                "ndwi": ndwi,
+                "fvc":  fvc,
+            }
         )
         return ds
+
+    # ──────────────────────────────────────────
+    # 辅助计算
+    # ──────────────────────────────────────────
+
+    @staticmethod
+    def _compute_ndwi(sr_ds: xr.Dataset) -> xr.DataArray:
+        """NDWI = (Green - NIR) / (Green + NIR)"""
+        green = sr_ds["green"].astype(float)
+        nir   = sr_ds["nir"].astype(float)
+        ndwi  = (green - nir) / (green + nir + 1e-10)
+        ndwi  = ndwi.clip(-1.0, 1.0)
+        ndwi.attrs = {"long_name": "NDWI (MOD09A1)", "units": "dimensionless"}
+        return ndwi
+
+    @staticmethod
+    def _compute_fvc(ndvi: xr.DataArray) -> xr.DataArray:
+        """FVC = (NDVI - NDVImin) / (NDVImax - NDVImin)，范围 [0,1]"""
+        fvc = (ndvi - NDVI_BARE_SOIL) / (NDVI_FULL_COVER - NDVI_BARE_SOIL + 1e-10)
+        fvc = fvc.clip(0.0, 1.0)
+        fvc.attrs = {"long_name": "植被覆盖度 FVC (像元二分模型)", "units": "fraction [0,1]"}
+        return fvc
