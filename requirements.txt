@@ -1,0 +1,38 @@
+# 核心依赖
+pystac-client>=0.7.0          # STAC API 客户端
+planetary-computer>=1.0.0     # Microsoft Planetary Computer 资产签名
+stackstac>=0.5.0              # STAC Items → xarray（懒加载，无需预下载）
+rioxarray>=0.15.0             # 栅格 IO、重投影、裁剪（基于 rasterio + xarray）
+rasterio>=1.3.0               # 底层栅格读写
+pyproj>=3.6.0                 # 坐标系转换
+
+# 数据处理
+numpy>=1.24.0
+pandas>=2.0.0
+xarray>=2023.1.0
+dask[array]>=2023.1.0         # 并行懒加载计算
+
+# 地理空间分析
+geopandas>=0.14.0             # 矢量数据处理
+shapely>=2.0.0                # 几何运算
+scipy>=1.11.0                 # 统计检验（MK 检验、相关性）
+scikit-image>=0.21.0          # 形态学操作（骨架化、中心线提取）
+scikit-learn>=1.3.0           # 多元回归分析
+
+# 趋势检验
+pymannkendall>=1.4.3          # Mann-Kendall 趋势检验
+
+# 可视化
+matplotlib>=3.7.0
+cartopy>=0.22.0               # 地图投影与底图
+folium>=0.14.0                # 交互式 Web 地图
+branca>=0.6.0                 # folium 辅助
+
+# 报告生成
+jinja2>=3.1.0                 # HTML 报告模板
+weasyprint>=60.0              # HTML → PDF 转换（可选）
+
+# 开发工具
+jupyter>=1.0.0
+ipykernel>=6.0.0
+tqdm>=4.65.0                  # 进度条
